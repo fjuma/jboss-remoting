@@ -26,6 +26,7 @@ import java.util.concurrent.CancellationException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 import org.wildfly.common.Assert;
 import org.wildfly.security.auth.client.AuthenticationConfiguration;
@@ -98,12 +99,24 @@ final class ConnectionInfo {
                             final ConnectionInfo outer = ConnectionInfo.this;
                             synchronized (outer) {
                                 assert state == maybeShared;
-                                if (connection.supportsRemoteAuth()) {
-                                    // shared!
-                                    state = new Shared(futureResult, Collections.emptyMap());
-                                } else {
-                                    // unsharable :(
-                                    state = new NotShared(Collections.singletonMap(authenticationConfiguration, futureResult));
+                                try {
+                                    // transition to the next state and resolve all pending attempts
+                                    maybeShared.pendingAttemptsLock.writeLock().lock();
+                                    if (connection.supportsRemoteAuth()) {
+                                        // shared!
+                                        state = new Shared(futureResult, Collections.emptyMap());
+                                    } else {
+                                        // unsharable :(
+                                        state = new NotShared(Collections.singletonMap(authenticationConfiguration, futureResult));
+                                    }
+                                    for (Map.Entry<AuthenticationConfiguration, FutureResult<Connection>> pendingAttempt : maybeShared.pendingAttempts.entrySet()) {
+                                        final AuthenticationConfiguration pendingAuthenticationConfiguration = pendingAttempt.getKey();
+                                        final FutureResult<Connection> pendingFutureResult = pendingAttempt.getValue();
+                                        final IoFuture<Connection> realAttempt = ConnectionInfo.this.getConnection(endpoint, key, pendingAuthenticationConfiguration, true);
+                                        splice(pendingFutureResult, realAttempt, pendingAuthenticationConfiguration);
+                                    }
+                                } finally {
+                                    maybeShared.pendingAttemptsLock.writeLock().unlock();
                                 }
                             }
                         }
@@ -134,6 +147,7 @@ final class ConnectionInfo {
         private final AuthenticationConfiguration authenticationConfiguration;
         private final IoFuture<Connection> attempt;
         private final Map<AuthenticationConfiguration, FutureResult<Connection>> pendingAttempts = new ConcurrentHashMap<>();
+        private final ReentrantReadWriteLock pendingAttemptsLock = new ReentrantReadWriteLock();
 
         MaybeShared(final AuthenticationConfiguration authenticationConfiguration, final IoFuture<Connection> attempt) {
             this.authenticationConfiguration = authenticationConfiguration;
@@ -141,43 +155,39 @@ final class ConnectionInfo {
         }
 
         IoFuture<Connection> getConnection(final EndpointImpl endpoint, final ConnectionKey key, final AuthenticationConfiguration authenticationConfiguration, boolean doConnect) {
-            if (authenticationConfiguration.equals(this.authenticationConfiguration)) {
-                return attempt;
-            } else {
-                FutureResult<Connection> futureResult = pendingAttempts.get(authenticationConfiguration);
-                if (futureResult != null) {
-                    return futureResult.getIoFuture();
+            try {
+                pendingAttemptsLock.readLock().lock();
+                if (authenticationConfiguration.equals(this.authenticationConfiguration)) {
+                    return attempt;
                 } else {
-                    if (! doConnect) {
-                        return null;
-                    }
-                    futureResult = new FutureResult<>(endpoint.getExecutor());
-                    final FutureResult<Connection> appearing = pendingAttempts.putIfAbsent(authenticationConfiguration, futureResult);
-                    if (appearing != null) {
-                        return appearing.getIoFuture();
-                    }
-                }
-                assert doConnect;
-                final IoFuture<Connection> ioFuture = futureResult.getIoFuture();
-                final AtomicBoolean cancelFlag = new AtomicBoolean();
-                final FutureResult<Connection> finalFutureResult = futureResult;
-                futureResult.addCancelHandler(new Cancellable() {
-                    public Cancellable cancel() {
-                        cancelFlag.set(true);
-                        finalFutureResult.setCancelled();
-                        return this;
-                    }
-                });
-                attempt.addNotifier((f2, futureResult1) -> {
-                    if (cancelFlag.get()) {
-                        futureResult1.setCancelled();
+                    FutureResult<Connection> futureResult = pendingAttempts.get(authenticationConfiguration);
+                    if (futureResult != null) {
+                        return futureResult.getIoFuture();
                     } else {
-                        final IoFuture<Connection> realAttempt = ConnectionInfo.this.getConnection(endpoint, key, authenticationConfiguration, true);
-                        futureResult1.addCancelHandler(realAttempt);
-                        splice(futureResult1, realAttempt, authenticationConfiguration);
+                        if (! doConnect) {
+                            return null;
+                        }
+                        futureResult = new FutureResult<>(endpoint.getExecutor());
+                        final FutureResult<Connection> appearing = pendingAttempts.putIfAbsent(authenticationConfiguration, futureResult);
+                        if (appearing != null) {
+                            return appearing.getIoFuture();
+                        }
                     }
-                }, futureResult);
-                return ioFuture;
+                    assert doConnect;
+                    final IoFuture<Connection> ioFuture = futureResult.getIoFuture();
+                    final AtomicBoolean cancelFlag = new AtomicBoolean();
+                    final FutureResult<Connection> finalFutureResult = futureResult;
+                    futureResult.addCancelHandler(new Cancellable() {
+                        public Cancellable cancel() {
+                            cancelFlag.set(true);
+                            finalFutureResult.setCancelled();
+                            return this;
+                        }
+                    });
+                    return ioFuture;
+                }
+            } finally {
+                pendingAttemptsLock.readLock().unlock();
             }
         }
 
